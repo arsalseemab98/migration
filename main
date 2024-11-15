@@ -1,0 +1,167 @@
+import pdfplumber
+import re
+import json
+import os
+from google.cloud import storage
+
+# Initialize Google Cloud Storage client
+storage_client = storage.Client()
+
+# Define regex patterns for each required section header with names matching the desired JSON structure
+section_headers = {
+    'dom_date': r'\bDom\b|\bDate\b',
+    'klagande': r'\bKlagande\b',
+    'motpart': r'\bMotpart\b',
+    'overklagat_beslut': r'\bÖVERKLAGAT BESLUT\b',
+    'saken': r'\bSAKEN\b',
+    'migrationdomstolens_avgorande': r'\bMIGRATIONSDOMSTOLENS AVGÖRANDE\b',
+    'yrkande_och_installning': r'\bYRKANDE OCH INSTÄLLNING\b',
+    'skalen_for_avgorandet': r'\bSKÄLEN FÖR AVGÖRANDET\b',
+    'arende_om_arbetstillstand': r'\bÄrende om arbetstillstånd\b',
+    'beslut': r'\bBeslut\b',
+    'din_ansokan': r'\bDin ansökan\b',
+    'bestammelser': r'\bBestämmelser som beslutet grundas på\b',
+    'bevisning': r'\bBevisning i ärendet\b',
+    'migrationsverkets_bedomning': r'\bMigrationsverkets bedömning\b',
+    'pass_och_identitet': r'\bPass och identitet\b',
+    'din_anstallning': r'\bDin anställning\b'
+}
+
+# Define regex patterns for unwanted lines (footers), borderlines, and additional headers
+footer_pattern = r'(Page\s\d+|\bConfidential\b|\bPage \d+ of \d+\b|Migrationsverket|Dok\.Id\s\d+|Sida\s\d+)'
+borderline_pattern = r'^[\-_]{5,}$'  # Detects lines of 5 or more underscores or hyphens
+additional_header_pattern = r'\b[A-ZÄÖÅ]{2,}\b(?:\s+[A-ZÄÖÅ]{2,})*'  # Detects uppercase headers
+
+# Bucket names
+input_bucket_name = 'input-pdf-bucket'
+output_bucket_name = 'output-json-bucket'
+
+# Function to download PDF from GCS bucket
+def download_pdf_from_gcs(bucket_name, source_blob_name, destination_file_name):
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(source_blob_name)
+    blob.download_to_filename(destination_file_name)
+    print(f"Downloaded {source_blob_name} to {destination_file_name}.")
+
+# Function to upload JSON to GCS bucket
+def upload_json_to_gcs(bucket_name, destination_blob_name, file_path):
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(destination_blob_name)
+    blob.upload_from_filename(file_path)
+    print(f"Uploaded {file_path} to {destination_blob_name} in bucket {bucket_name}.")
+
+# Function to extract sections based on headers, ignoring footers, handling multi-page sections, and capturing paragraphs under borderlines
+def extract_full_sections(file_path, section_patterns, footer_pattern, borderline_pattern):
+    extracted_data = {key: "" for key in section_patterns.keys()}
+    current_section = None
+    multi_page_text = ""  # To store content of the current multi-page section
+    capture_next_paragraph = False  # Flag to capture paragraph following a borderline
+
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            # Compile regex patterns for section headers, footers, and borderlines
+            compiled_patterns = {k: re.compile(v, re.IGNORECASE) for k, v in section_patterns.items()}
+            footer_regex = re.compile(footer_pattern, re.IGNORECASE)
+            additional_header_regex = re.compile(additional_header_pattern)
+            borderline_regex = re.compile(borderline_pattern)
+
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                if not text:
+                    continue
+                
+                # Split the page text into lines for easier section detection
+                lines = text.split('\n')
+                found_section_on_page = False
+
+                for line in lines:
+                    # Skip lines that match the footer pattern
+                    if footer_regex.search(line):
+                        continue
+
+                    # Check if the line matches a borderline pattern
+                    if borderline_regex.match(line):
+                        capture_next_paragraph = True  # Set flag to capture the following paragraph
+                        continue
+                    
+                    # Capture paragraph following a borderline
+                    if capture_next_paragraph and line.strip():
+                        if current_section:
+                            extracted_data[current_section] += "\nBelow Borderline: " + line.strip()
+                        else:
+                            extracted_data["additional_paragraph_below_borderline"] = line.strip()
+                        capture_next_paragraph = False  # Reset flag after capturing paragraph
+
+                    # Check if line matches any predefined section header
+                    if not found_section_on_page:
+                        for section, pattern in compiled_patterns.items():
+                            if pattern.search(line):
+                                # If a new section is found, save the previous section's text
+                                if current_section:
+                                    extracted_data[current_section] += multi_page_text.strip() + "\n"
+                                
+                                # Start a new section
+                                current_section = section
+                                multi_page_text = line + "\n"  # Start with the header line
+                                found_section_on_page = True
+                                break
+
+                    # Check for additional headers not in the predefined section list
+                    if not found_section_on_page:
+                        if additional_header_regex.search(line) and line.strip() not in extracted_data:
+                            if current_section:
+                                extracted_data[current_section] += multi_page_text.strip() + "\n"
+                            
+                            # Add dynamic section header
+                            current_section = line.strip()
+                            multi_page_text = line + "\n"
+                            extracted_data[current_section] = ""
+                            found_section_on_page = True
+                    else:
+                        # Append line to current section if no new header is found
+                        multi_page_text += line + "\n"
+
+            # Save the last section if there's leftover text
+            if current_section and multi_page_text:
+                extracted_data[current_section] += multi_page_text.strip()
+    
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None
+    
+    return extracted_data
+
+# Main function to process all PDFs from the input bucket
+def process_pdfs_from_bucket(input_bucket_name, output_bucket_name):
+    input_bucket = storage_client.bucket(input_bucket_name)
+    blobs = input_bucket.list_blobs()
+    
+    for blob in blobs:
+        if blob.name.endswith('.pdf'):
+            # Define local paths for processing
+            local_pdf_path = f"/tmp/{blob.name.split('/')[-1]}"
+            local_json_path = f"/tmp/{blob.name.split('/')[-1].replace('.pdf', '.json')}"
+            
+            # Step 1: Download PDF from input bucket
+            download_pdf_from_gcs(input_bucket_name, blob.name, local_pdf_path)
+            
+            # Step 2: Extract full sections from the PDF
+            print(f"Processing file: {blob.name}")
+            raw_data = extract_full_sections(local_pdf_path, section_headers, footer_pattern, borderline_pattern)
+            
+            if raw_data:
+                # Save the processed data as JSON locally
+                with open(local_json_path, 'w', encoding='utf-8') as json_file:
+                    json.dump(raw_data, json_file, indent=4, ensure_ascii=False)
+                
+                # Step 3: Upload JSON to output bucket
+                output_blob_name = f"{blob.name.replace('.pdf', '.json')}"
+                upload_json_to_gcs(output_bucket_name, output_blob_name, local_json_path)
+                
+                # Clean up local files
+                os.remove(local_pdf_path)
+                os.remove(local_json_path)
+                print(f"Finished processing and cleaned up local files for {blob.name}")
+
+# Run the main function
+process_pdfs_from_bucket(input_bucket_name, output_bucket_name)
